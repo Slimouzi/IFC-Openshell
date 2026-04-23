@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<title>IFC Viewer — Clash Inspector</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#1e1e1e; font-family:-apple-system,Segoe UI,Roboto,sans-serif; color:#e0e0e0; overflow:hidden; }
+  #viewer { position:absolute; top:0; left:0; right:0; bottom:0; }
+  #overlay {
+    position:absolute; top:12px; left:12px; z-index:100;
+    background:rgba(30,30,30,.9); padding:10px 14px; border-radius:8px;
+    max-width:320px; font-size:12px; border:1px solid #444;
+  }
+  #overlay h3 { margin:0 0 8px; font-size:13px; color:#4fc3f7; }
+  #overlay button, #overlay label {
+    display:block; margin-top:6px; width:100%; padding:6px 10px;
+    background:#2d2d2d; color:#e0e0e0; border:1px solid #555; border-radius:4px;
+    cursor:pointer; font-size:12px;
+  }
+  #overlay button:hover { background:#3d3d3d; }
+  #stats { position:absolute; bottom:12px; left:12px; z-index:100;
+    background:rgba(30,30,30,.9); padding:8px 12px; border-radius:6px; font-size:11px; }
+  #loading {
+    position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+    z-index:200; display:none; color:#4fc3f7; font-size:14px;
+  }
+  .legend { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:4px; vertical-align:middle; }
+  .critical { background:#ff3b30; }
+  .major    { background:#ff9500; }
+  .minor    { background:#ffcc00; }
+  #selected {
+    position:absolute; top:12px; right:12px; z-index:100;
+    background:rgba(30,30,30,.92); padding:10px 14px; border-radius:8px;
+    max-width:380px; font-size:12px; border:1px solid #4fc3f7; display:none;
+  }
+  #selected h4 { margin:0 0 6px; color:#4fc3f7; font-size:12px; }
+  #selected .field { margin:4px 0; }
+  #selected .label { color:#888; }
+</style>
+</head>
+<body>
+<div id="overlay">
+  <h3>🧊 Visionneuse 3D</h3>
+  <label>Fichier IFC :
+    <input type="file" id="fileInput" accept=".ifc" style="margin-top:4px;"/>
+  </label>
+  <button id="resetView">🎯 Recentrer la vue</button>
+  <button id="toggleMarkers">👁️ Afficher/Masquer markers</button>
+  <button id="toggleWire">🧬 Basculer filaire</button>
+  <div style="margin-top:8px; font-size:10px; color:#888;">
+    <span class="legend critical"></span> Critique
+    <span class="legend major"></span> Majeur
+    <span class="legend minor"></span> Mineur
+  </div>
+</div>
+
+<div id="loading">Chargement de l'IFC…</div>
+<div id="stats"></div>
+<div id="selected"></div>
+<div id="viewer"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+    "web-ifc": "https://unpkg.com/web-ifc@0.0.53/web-ifc-api.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { IfcAPI } from 'web-ifc';
+
+// ── Récupération des markers clash depuis query string ─────────────────────
+const urlParams = new URLSearchParams(window.location.search);
+const markersData = urlParams.get('markers');
+const focusId = urlParams.get('focus');
+let markers = [];
+try {
+  if (markersData) markers = JSON.parse(decodeURIComponent(markersData));
+} catch(e) { console.warn('Markers invalides', e); }
+
+// ── Scene Three.js ────────────────────────────────────────────────────────
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x2a2a2a);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 5000);
+camera.position.set(20, 20, 20);
+
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+document.getElementById('viewer').appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+// Lumières
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+dir.position.set(10, 20, 10);
+scene.add(dir);
+
+// Grille
+const grid = new THREE.GridHelper(100, 50, 0x444444, 0x222222);
+scene.add(grid);
+
+// Axes
+scene.add(new THREE.AxesHelper(5));
+
+// ── IFC loader ────────────────────────────────────────────────────────────
+const ifcApi = new IfcAPI();
+ifcApi.SetWasmPath("https://unpkg.com/web-ifc@0.0.53/");
+let ifcMeshes = [];
+let modelId = null;
+
+async function loadIfcFile(file) {
+  document.getElementById('loading').style.display = 'block';
+
+  try {
+    await ifcApi.Init();
+    const buffer = new Uint8Array(await file.arrayBuffer());
+    modelId = ifcApi.OpenModel(buffer, { COORDINATE_TO_ORIGIN: true });
+
+    // Remove previous
+    ifcMeshes.forEach(m => scene.remove(m));
+    ifcMeshes = [];
+
+    ifcApi.StreamAllMeshes(modelId, (mesh) => {
+      const placedGeom = mesh.geometries;
+      for (let i = 0; i < placedGeom.size(); i++) {
+        const pg = placedGeom.get(i);
+        const geom = ifcApi.GetGeometry(modelId, pg.geometryExpressID);
+        const verts = ifcApi.GetVertexArray(geom.GetVertexData(), geom.GetVertexDataSize());
+        const indices = ifcApi.GetIndexArray(geom.GetIndexData(), geom.GetIndexDataSize());
+
+        const bufferGeom = new THREE.BufferGeometry();
+        const positions = new Float32Array(verts.length / 2);
+        const normals = new Float32Array(verts.length / 2);
+        for (let j = 0; j < verts.length; j += 6) {
+          positions[j/2]   = verts[j];
+          positions[j/2+1] = verts[j+1];
+          positions[j/2+2] = verts[j+2];
+          normals[j/2]     = verts[j+3];
+          normals[j/2+1]   = verts[j+4];
+          normals[j/2+2]   = verts[j+5];
+        }
+        bufferGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        bufferGeom.setAttribute('normal',   new THREE.BufferAttribute(normals, 3));
+        bufferGeom.setIndex(new THREE.BufferAttribute(new Uint32Array(indices), 1));
+
+        const color = new THREE.Color(pg.color.x, pg.color.y, pg.color.z);
+        const material = new THREE.MeshLambertMaterial({
+          color,
+          transparent: pg.color.w < 1,
+          opacity: pg.color.w,
+        });
+
+        const threeMesh = new THREE.Mesh(bufferGeom, material);
+        const m = new THREE.Matrix4();
+        m.fromArray(pg.flatTransformation);
+        threeMesh.applyMatrix4(m);
+        threeMesh.userData.expressID = pg.geometryExpressID;
+
+        scene.add(threeMesh);
+        ifcMeshes.push(threeMesh);
+      }
+    });
+
+    // Recentre
+    fitToView();
+    document.getElementById('stats').innerHTML =
+      `📊 ${ifcMeshes.length} meshes · ${markers.length} clash(s)`;
+
+  } catch(e) {
+    alert('Erreur chargement IFC : ' + e.message);
+    console.error(e);
+  } finally {
+    document.getElementById('loading').style.display = 'none';
+  }
+}
+
+// ── Markers clash ─────────────────────────────────────────────────────────
+let markerMeshes = [];
+const sevColors = {
+  'Critique': 0xff3b30,
+  'Majeur':   0xff9500,
+  'Mineur':   0xffcc00,
+};
+
+function addMarkers() {
+  markerMeshes.forEach(m => scene.remove(m));
+  markerMeshes = [];
+
+  markers.forEach(mk => {
+    const [x, y, z] = mk.center || [0, 0, 0];
+    const color = sevColors[mk.severity] || 0xff3b30;
+    const geom = new THREE.SphereGeometry(0.3, 16, 16);
+    const mat = new THREE.MeshBasicMaterial({ color, transparent:true, opacity:0.8 });
+    const sphere = new THREE.Mesh(geom, mat);
+    sphere.position.set(x, y, z);
+    sphere.userData.clashId = mk.id;
+    sphere.userData.clashInfo = mk;
+    scene.add(sphere);
+    markerMeshes.push(sphere);
+
+    // Ring pour le highlight
+    const ringGeom = new THREE.RingGeometry(0.5, 0.7, 24);
+    const ringMat = new THREE.MeshBasicMaterial({
+      color, side: THREE.DoubleSide, transparent:true, opacity:0.5
+    });
+    const ring = new THREE.Mesh(ringGeom, ringMat);
+    ring.position.set(x, y, z);
+    ring.userData.isRing = true;
+    ring.userData.clashId = mk.id;
+    scene.add(ring);
+    markerMeshes.push(ring);
+  });
+}
+
+addMarkers();
+
+// ── Interactions ──────────────────────────────────────────────────────────
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+renderer.domElement.addEventListener('click', (event) => {
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObjects(markerMeshes.filter(m => !m.userData.isRing));
+
+  if (hits.length > 0) {
+    const info = hits[0].object.userData.clashInfo;
+    showSelected(info);
+  }
+});
+
+function showSelected(c) {
+  const el = document.getElementById('selected');
+  el.style.display = 'block';
+  el.innerHTML = `
+    <h4>⚠️ Clash sélectionné</h4>
+    <div class="field"><span class="label">Type :</span> ${c.type} <span class="legend ${c.severity==='Critique'?'critical':c.severity==='Majeur'?'major':'minor'}"></span>${c.severity}</div>
+    <div class="field"><span class="label">A :</span> ${c.a_class} / ${c.a_name}</div>
+    <div class="field"><span class="label">B :</span> ${c.b_class} / ${c.b_name}</div>
+    <div class="field"><span class="label">Distance :</span> ${(c.distance||0).toFixed(4)} m</div>
+    <div class="field"><span class="label">Set :</span> ${c.set_name || '?'}</div>
+    <div class="field"><span class="label">Position :</span> ${c.center.map(v=>v.toFixed(2)).join(', ')}</div>
+  `;
+}
+
+// ── Fit view ──────────────────────────────────────────────────────────────
+function fitToView() {
+  const box = new THREE.Box3();
+  [...ifcMeshes, ...markerMeshes].forEach(m => box.expandByObject(m));
+
+  if (box.isEmpty()) return;
+
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z);
+  const dist = maxDim * 1.8;
+
+  camera.position.set(center.x + dist, center.y + dist, center.z + dist);
+  controls.target.copy(center);
+  controls.update();
+}
+
+// Focus sur un clash spécifique si ?focus=clashId
+function focusOnClash(id) {
+  const mk = markers.find(m => m.id === id);
+  if (!mk) return;
+  const [x, y, z] = mk.center;
+  const target = new THREE.Vector3(x, y, z);
+  controls.target.copy(target);
+  camera.position.set(x + 8, y + 8, z + 6);
+  controls.update();
+  showSelected(mk);
+}
+
+if (focusId) setTimeout(() => focusOnClash(focusId), 200);
+
+// ── UI events ─────────────────────────────────────────────────────────────
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (file) loadIfcFile(file);
+});
+document.getElementById('resetView').addEventListener('click', fitToView);
+
+let markersVisible = true;
+document.getElementById('toggleMarkers').addEventListener('click', () => {
+  markersVisible = !markersVisible;
+  markerMeshes.forEach(m => m.visible = markersVisible);
+});
+
+let wireframe = false;
+document.getElementById('toggleWire').addEventListener('click', () => {
+  wireframe = !wireframe;
+  ifcMeshes.forEach(m => { m.material.wireframe = wireframe; });
+});
+
+// ── Render loop ───────────────────────────────────────────────────────────
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+
+  // Ring rotation
+  const t = Date.now() * 0.001;
+  markerMeshes.forEach(m => {
+    if (m.userData.isRing) m.rotation.z = t;
+  });
+
+  renderer.render(scene, camera);
+}
+animate();
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+fitToView();
+document.getElementById('stats').innerHTML = `📊 Chargez un IFC pour voir la géométrie · ${markers.length} clash(s) affiché(s)`;
+</script>
+</body>
+</html>
