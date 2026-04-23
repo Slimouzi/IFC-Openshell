@@ -1,0 +1,4 @@
+ifcopenshell>=0.8.3
+ifcclash>=0.8.5
+ifccsv>=0.8.5
+openpyxl>=3.1
